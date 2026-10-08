@@ -1,75 +1,239 @@
 # 🛡️ Verification-First Secure Communication Wrapper
-**PERURI Chip Hackathon 2026 - Kategori: IC Chip Design & FPGA Implementation**
 
-Repositori ini berisi kode sumber VHDL untuk purwarupa IP *Hardware Security* yang dirancang khusus untuk mengamankan komunikasi data pada perangkat *embedded* dan IoT. Sistem ini dibangun dengan arsitektur **Verify-Before-Release**, memastikan hanya data yang terverifikasi (bebas *error*, bebas *tampering*, dan *fresh*) yang diizinkan masuk ke sistem tujuan lintas *clock domain* (CDC).
+**Verification-First Secure Communication Wrapper for FPGA-Based Serial and CDC FIFO on Cyclone V SoC**
 
-Ditargetkan untuk diimplementasikan pada board **Terasic DE10-Nano (Intel Cyclone V SoC FPGA)**.
+PERURI Chip Hackathon 2026 — Kategori: *IC Chip Design & FPGA Implementation*
+Universitas Brawijaya · Target board: **Terasic DE10-Nano (Intel Cyclone V SoC `5CSEBA6U23I7`)**
 
-## 🌟 Fitur Utama
-* **Arsitektur Verify-Before-Release:** Gerbang verifikasi berbasis perangkat keras (FSM) untuk mencegah serangan *replay* dan *malformed frames*.
-* **Clock Domain Crossing (CDC) Aman:** Penggunaan Asynchronous FIFO dengan *Gray Code pointer* untuk menjembatani domain pengirim (50 MHz) dan penerima (125 MHz).
-* **Paralel & Pipelined (VHDL):** Pemrosesan dilakukan murni di *FPGA Fabric* (tanpa intervensi CPU) menghasilkan latensi deterministik yang jauh lebih cepat dari perangkat lunak.
-* **Ultra-Lightweight:** Konsumsi logika sangat rendah, ideal sebagai *IP Core* tambahan pada infrastruktur kritis.
+Repositori ini berisi kode sumber VHDL purwarupa *reusable hardware security IP* untuk mengamankan komunikasi data pada perangkat *embedded* dan IoT. Konsep utamanya adalah **Verify-Before-Release**: sebuah frame tidak langsung diteruskan, tetapi harus lolos pemeriksaan CRC, authentication, dan freshness terlebih dahulu. Hanya frame yang lolos semua tahap yang boleh masuk ke *asynchronous FIFO* menuju subsistem tujuan. Frame yang gagal dibuang (*fail-closed*) dan dicatat pada telemetry counter.
+
+---
+
+## 📌 Latar Belakang Singkat
+
+| Masalah | Keterbatasan pendekatan konvensional |
+|---|---|
+| Kesalahan transmisi | CRC dapat mendeteksi error, tetapi **tidak** memberi authentication. |
+| Manipulasi & replay | Authentication saja belum cukup bila receiver tidak menyimpan state *freshness*. |
+| Beban pemrosesan | Security di CPU memaksa setiap frame diproses sekuensial dan menambah latency serta beban prosesor. |
+| Perpindahan antar-clock domain | Tanpa mekanisme CDC yang tepat dapat terjadi metastability, overflow, dan underflow. |
+
+**Solusi:** security gate diletakkan di FPGA *sebelum* CDC FIFO, sehingga data yang belum terverifikasi tidak dapat mencapai destination subsystem. Pemrosesan di FPGA bersifat paralel dan *pipelined* dengan latency deterministik (jumlah clock cycle per frame tetap) serta tidak membebani CPU per frame.
+
+---
+
+## 📊 Status Implementasi Saat Ini
+
+Purwarupa saat ini adalah **fondasi arsitektur CDC dan verification gate dasar**. Inti kriptografi Ascon belum diintegrasikan.
+
+| Fitur | Status |
+|---|---|
+| Secure framing + CRC | ✅ Terimplementasi di RTL |
+| Freshness checking | ✅ Terimplementasi di RTL (dasar) |
+| FSM `security_controller` (Verify-Before-Release) | ✅ Terimplementasi di RTL |
+| Asynchronous FIFO (Gray pointer) + CDC checker | ✅ Terimplementasi di RTL |
+| PLL 50 → 125 MHz, top-level DE10-Nano (Switch/LED) | ✅ Terimplementasi |
+| Simulasi testbench dasar (Questa) | ✅ Waveform dasar tersedia (lihat proposal, Lampiran 3) |
+| **Ascon-AEAD128 core** (enkripsi/dekripsi + tag) | 🔲 Direncanakan — Bootcamp Hari 1 |
+| Fault injector (bit flip, replay, malformed) | 🔲 Direncanakan — Bootcamp Hari 2 *(kontrol Switch sudah dipetakan di top-level)* |
+| Telemetry counter / CSR + HPS-FPGA bridge | 🔲 Direncanakan — Bootcamp Hari 2 |
+| Assertion (VHDL-2008 / PSL) & CDC verification lengkap | 🔲 Direncanakan |
+| Constraint SDC untuk lintasan Gray CDC | 🔲 Direncanakan |
+| Uji hardware DE10-Nano, SignalTap, benchmark | 🔲 Direncanakan — Bootcamp Hari 3 |
+
+---
+
+## 🏗️ Arsitektur
+
+FPGA fabric berperan sebagai **data plane**, sedangkan HPS (ARM) sebagai **control plane** (konfigurasi parameter, key/session management, pengaturan fault injection, monitoring status melalui HPS-FPGA Bridge/CSR).
+
+```mermaid
+flowchart LR
+    subgraph TX["TX Path (clk_send, 50 MHz)"]
+        SRC[Input / Source] --> FRM[Secure Framer<br/>header, seq/nonce, payload]
+        FRM --> CRCG[CRC-16 gen]
+        CRCG --> AUTH[Auth Tag<br/>Ascon-AEAD128*]
+        AUTH --> STX[Serial TX]
+    end
+    STX --> FI[Fault Injector*<br/>bit flip / replay / malformed]
+    FI --> SRX
+    subgraph RX["RX Path (clk_recv, 125 MHz)"]
+        SRX[Serial RX] --> PARSE[Frame Parser]
+        PARSE --> VBR
+        subgraph VBR["Verify-Before-Release"]
+            direction TB
+            V1[1. CRC-16] --> V2[2. Freshness] --> V3[3. Auth tag*] --> V4[4. Update sequence]
+        end
+    end
+    VBR -- PASS --> FIFO[Async FIFO<br/>Gray pointer + 2-FF sync]
+    VBR -- FAIL / drop --> TEL[Telemetry Counters*]
+    FIFO --> DST[Destination Module<br/>clk_dest]
+    FIFO -. overflow/underflow .-> TEL
+```
+<sub>`*` = direncanakan (belum ada di repositori ini). Diagram lengkap ada pada proposal, Lampiran 1.</sub>
+
+### FSM Verify-Before-Release
+
+```
+IDLE → CHECK_CRC → CHECK_FRESH → CHECK_TAG → UPDATE_SEQ → RELEASE → IDLE
+  │         │            │            │                        │
+  └─ malformed / crc_err / replay / auth_fail / fifo_full ──────┴──► DROP (counter++) → IDLE
+```
+
+Properti keamanan yang menjadi target desain:
+* Frame yang belum terverifikasi **tidak boleh** menghasilkan `output_valid`.
+* *Sequence state* hanya diperbarui **setelah** tag valid (mencegah replay dan *state poisoning*).
+* FIFO tidak melakukan *read* saat empty atau *write* saat full.
+* Frame gagal → *fail-closed* (dibuang dan dicatat).
+
+### Fault Model
+Bit flip · replay · malformed frame · FIFO overflow/underflow.
+
+---
 
 ## 📂 Struktur Modul & Berkas (VHDL)
-Sistem dipecah menjadi beberapa subsistem fungsional untuk kemudahan verifikasi dan pengembangan berkelanjutan:
 
-### 1. Top-Level & Clocking (Integrasi Sistem)
-* `de10_nano_top.vhd` — Pembungkus level teratas untuk pemetaan pin perangkat keras (Switch, LED, Clock) board DE10-Nano.
-* `top_level.vhd` — Modul integrasi utama yang merangkai sistem Pengirim (TX) dan Penerima (RX).
-* `pll_sys.qip` & `pll_sys.vhd` — Intel FPGA IP (Phase-Locked Loop) untuk mensintesis *clock* 125 MHz dari osilator bawaan 50 MHz.
+### 1. Top-Level & Clocking
+| Berkas | Fungsi |
+|---|---|
+| `de10_nano_top.vhd` | Pembungkus level teratas: pemetaan pin DE10-Nano (Switch untuk kontrol fault injection, LED untuk indikator status verifikasi, Clock). |
+| `top_level.vhd` | Integrasi sistem Pengirim (TX) dan Penerima (RX). |
+| `pll_sys.vhd` / `pll_sys.qip` | Intel FPGA IP (PLL) untuk membangkitkan 125 MHz dari osilator 50 MHz. |
 
-### 2. Logika Keamanan & Kriptografi
-* `secure_wrapper.vhd` — Mesin inti pembungkus kriptografi.
-* `secure_framing.vhd` — Penyusun paket data (*framing*) dan pelindung integritas bingkai.
-* `security_controller.vhd` — Pengontrol status (FSM) untuk operasi enkripsi dan verifikasi.
+### 2. Logika Keamanan
+| Berkas | Fungsi |
+|---|---|
+| `secure_wrapper.vhd` | Kerangka antarmuka modul keamanan *(tempat integrasi Ascon-AEAD128 nantinya)*. |
+| `secure_framing.vhd` | Penyusunan paket/frame data dan CRC. |
+| `security_controller.vhd` | FSM Verify-Before-Release. |
 
-### 3. Manajemen Memori & CDC (Clock Domain Crossing)
-* `async_fifo.vhd` — Antrean asinkron untuk mentransfer data antar domain frekuensi secara aman.
-* `gray_counter.vhd` — Penghitung biner *Gray code* untuk memastikan stabilitas sinkronisasi *pointer* FIFO.
-* `cdc_checker.vhd` — Pemantau stabilitas sinyal dan *metastability* lintas *clock*.
+### 3. Manajemen Memori & CDC
+| Berkas | Fungsi |
+|---|---|
+| `async_fifo.vhd` | Antrean asinkron antar clock domain (flag full/empty, deteksi overflow/underflow). |
+| `gray_counter.vhd` | Penghitung Gray code untuk pointer FIFO. |
+| `cdc_checker.vhd` | Pemantau stabilitas sinyal lintas clock. |
 
 ### 4. Komunikasi & I/O
-* `serdes_interface.vhd` — Antarmuka *Serializer/Deserializer* untuk komunikasi serial antar-modul.
+| Berkas | Fungsi |
+|---|---|
+| `serdes_interface.vhd` | Antarmuka serializer/deserializer untuk *FPGA-based serial link*. |
 
-## 🚀 Hasil Implementasi & Performa (Synthesis Output)
-Sistem ini telah berhasil disintesis menggunakan **Intel Quartus Prime 25.1 Lite Edition** untuk *chip* `5CSEBA6U23I7` (Cyclone V) dengan hasil metrik sebagai berikut:
+> **Catatan:** DE10-Nano tidak memiliki *dedicated high-speed SerDes transceiver*, sehingga komunikasi pada purwarupa memakai serial link berbasis fabric FPGA sebagai media demonstrasi.
 
-### 1. Diagram RTL (Skematik Arsitektur Fisik)
-*(Visualisasi pemisahan domain frekuensi `FPGA_CLK1_50` dan `outclk_0` (125 MHz) melalui gerbang `top_level`)*
-![RTL Viewer] <img width="1908" height="1139" alt="Screenshot 2026-10-08 115156" src="https://github.com/user-attachments/assets/69713281-1f31-4713-9fe9-ecd04859d10a" />
+### Modul yang Direncanakan
+`ascon_aead128_core`, `crc16_gen/chk`, `frame_parser`, `freshness_checker`, `verify_gate`, `reset_sync`, `fault_injector`, `telemetry_csr`, `top_wrapper` (integrasi Platform Designer).
 
-### 2. Resource Usage (Sangat Efisien)
-Modul keamanan ini terbukti **ultra-lightweight** dan tidak akan membebani kapasitas SoC:
-* **Logic Utilization:** 32 ALMs (< 1% dari total 41.910 ALMs)
-* **Dedicated Logic Registers:** 55
-* **I/O Pins:** 15 pin (5%)
-* **PLL:** 1 (17%)
+---
 
-![Resource Usage] <img width="1183" height="696" alt="Screenshot 2026-10-08 115036" src="https://github.com/user-attachments/assets/6fa983ad-16ad-44ca-a034-0505894670ae" />
-<img width="1186" height="265" alt="Screenshot 2026-10-08 115042" src="https://github.com/user-attachments/assets/f079fed1-2bab-4013-a59c-b40641576ed3" />
+## 🚀 Hasil Sintesis (Quartus Prime 25.1 Lite)
 
+Target: `5CSEBA6U23I7` (Cyclone V).
 
+> ⚠️ **Konteks pengukuran:** angka berikut disintesis dari level `top_level` dengan **input uji konstan** untuk demonstrasi fungsi dasar, dan **belum memuat Ascon-AEAD128**, fault injector, maupun telemetry. Angka ini adalah *baseline* fondasi CDC, **bukan** estimasi resource sistem final.
 
-### 3. Timing Analysis (Fmax)
-Berdasarkan *Slow 1100mV 100C Model*, sirkuit VHDL ini terbukti melampaui target frekuensi operasional dengan *margin* yang sangat aman:
-* **Sirkuit Penerima/Kriptografi (`divclk`):** Max **141.06 MHz** (Target: 125 MHz)
-* **Sirkuit Pengirim/Sumber (`FPGA_CLK1_50`):** Max **214.22 MHz**
+### Resource Usage
 
-![Fmax Summary] <img width="1194" height="612" alt="Screenshot 2026-10-08 115126" src="https://github.com/user-attachments/assets/d034f36e-a64d-415b-bb54-86fdcf9e2ac9" />
+| Komponen | Hasil terukur | Kapasitas DE10-Nano |
+|---|---|---|
+| ALMs | 32 (< 1%) | 41.910 |
+| Combinational ALUT | 59 | – |
+| Dedicated Registers | 55 | – |
+| M10K / Memory Bits | 0 / 0 | 553 / 5.662.720 |
+| DSP Blocks | 0 | 112 |
+| PLL | 1 (17%) | 6 |
+| User I/O Pins | 15 (5%) | 314 |
 
+Estimasi sistem final (setelah Ascon + fault injector + telemetry): LUT ≤ 60%, register ≤ 60%, M10K ≤ 70%, DSP ≤ 50%.
 
-## 🛠️ Cara Menjalankan Kompilasi
-1. Klon repositori ini ke komputer Anda: `git clone https://github.com/SheindyAfriliaManurung/Peruri2026.git`
-2. Buka aplikasi **Intel Quartus Prime**.
-3. Klik **File -> Open Project...** dan pilih file `de10_nano_top.qpf`.
+![Resource Usage 1](https://github.com/user-attachments/assets/6fa983ad-16ad-44ca-a034-0505894670ae)
+![Resource Usage 2](https://github.com/user-attachments/assets/f079fed1-2bab-4013-a59c-b40641576ed3)
+
+### Timing Analysis (Fmax)
+
+Model: *Slow 1100mV 100C*.
+
+| Clock domain | Fmax | Target |
+|---|---|---|
+| Penerima (`divclk` / `outclk_0`) | **141,06 MHz** | 125 MHz |
+| Pengirim (`FPGA_CLK1_50`) | **214,22 MHz** | 50 MHz |
+
+Kedua domain memenuhi target frekuensi pada tahap ini. Namun, untuk *timing closure* penuh pada implementasi akhir, desain masih memerlukan **constraint SDC yang komprehensif**, khususnya `set_false_path` atau `set_max_delay` pada lintasan pointer Gray CDC. Margin pada domain penerima (≈ 13%) juga akan berkurang ketika inti Ascon ditambahkan.
+
+![Fmax Summary](https://github.com/user-attachments/assets/d034f36e-a64d-415b-bb54-86fdcf9e2ac9)
+
+### Diagram RTL
+Visualisasi pemisahan domain `FPGA_CLK1_50` dan `outclk_0` (125 MHz) melalui `top_level`.
+
+![RTL Viewer](https://github.com/user-attachments/assets/69713281-1f31-4713-9fe9-ecd04859d10a)
+
+---
+
+## 🧪 Verifikasi
+
+**Saat ini:** simulasi RTL dengan testbench VHDL konvensional di *Questa Intel FPGA Starter Edition 2025.2* (waveform dasar pada proposal, Lampiran 3).
+
+**Direncanakan:**
+* Testbench dengan clock pengirim 50 MHz dan penerima 125 MHz (rasio non-integer 2,5) untuk merepresentasikan asinkronitas ekstrem.
+* Assertion VHDL-2008 / PSL, misalnya: tidak ada perubahan pointer ilegal di `gray_counter` saat FIFO full/empty; frame tak terverifikasi tidak menghasilkan `output_valid`.
+* Skenario uji: frame normal, bit flip, authentication failure, replay, malformed frame, FIFO full/empty, reset, dan perpindahan antar-clock domain.
+* Uji hardware di DE10-Nano: fault injection via Switch, status `crc_error` / `replay_err` / penolakan frame pada LED, serta SignalTap.
+* Folder `sim/` berisi tabel hasil uji dan tangkapan waveform akan ditambahkan.
+
+### Metrik Keberhasilan
+| Aspek | Target |
+|---|---|
+| Keamanan | 100% rejection terhadap tampering dan replay · 0 frame tidak valid lolos ke destination · 0 assertion violation · 100% deteksi overflow/underflow |
+| Performa | Latency per frame, throughput, Fmax, timing slack, resource utilization — dibandingkan dengan implementasi software referensi (Ascon-AEAD128 dalam C/Python) dan serial link berbasis CRC saja |
+
+---
+
+## 🗓️ Rencana & Roadmap
+
+| Hari Bootcamp | Fokus | Target |
+|---|---|---|
+| **Hari 1** | Architecture & RTL Baseline | Secure frame, CRC, **Ascon-AEAD128**, freshness checker, baseline async FIFO |
+| **Hari 2** | Integration & Verification | TX/RX terintegrasi, Verify-Before-Release, fault injector, telemetry, testbench, assertion |
+| **Hari 3** | FPGA Implementation & Demo | Bitstream, timing/resource report, SignalTap, hardware fault injection, benchmark, demo final |
+
+---
+
+## 🛠️ Tools
+
+* **Bahasa:** VHDL
+* **Sintesis & timing:** Intel Quartus Prime 25.1 Lite Edition
+* **Simulasi:** Questa Intel FPGA Starter Edition 2025.2
+* **Integrasi HPS-FPGA (rencana):** Platform Designer (Qsys)
+* **Otomasi pengujian & benchmark:** Python
+
+## ▶️ Cara Menjalankan Kompilasi
+
+1. Klon repositori:
+   ```bash
+   git clone https://github.com/SheindyAfriliaManurung/Peruri2026.git
+   ```
+2. Buka **Intel Quartus Prime**.
+3. **File → Open Project…** lalu pilih `de10_nano_top.qpf`.
 4. Di panel *Tasks*, klik dua kali **Compile Design**.
-5. Tunggu hingga proses kompilasi selesai untuk melihat laporan Fitter, Timing, dan RTL Viewer.
+5. Setelah selesai, lihat laporan Fitter, Timing Analyzer, dan RTL Viewer.
 
-*(Catatan: Pre-silicon verifikasi telah dilakukan menggunakan Questa FSE).*
+---
 
-## 👥 Tim Pengembang
-* **Sheindy Afrilia Manurung (Ketua)** — Arsitektur Digital & Integrasi Top-Level
-* **M. Hathori Astro** — Logika Keamanan & Kriptografi Hardware
-* **Afifah Zuriah Mindarini** — Manajemen Memori & Sinkronisasi CDC
-* **Agatha Triotama** — Antarmuka I/O & Verifikasi Pengujian
+## 👥 Tim
+
+| Nama | Peran | Tanggung jawab |
+|---|---|---|
+| **Sheindy Afrilia Manurung** (Ketua) | Integrasi & Koordinasi | `de10_nano_top`, `top_level`, `pll_sys` |
+| **Ahmadtovich Hathori Astro** | Kripto, Freshness & Kebijakan Nonce | `secure_wrapper`, `secure_framing`, `security_controller` |
+| **Afifah Zuriah Mindarini** | Memori & Stabilitas CDC | `async_fifo`, `gray_counter`, `cdc_checker` |
+| **Agatha Triotama** | Testbench, Laporan Quartus & Benchmark | `serdes_interface`, testbench & verifikasi, analisis Quartus, benchmark |
+
+**Dosen Pembimbing:** Wijaya Kurniawan, S.T., M.T., Ph.D. — Universitas Brawijaya
+
+## 📚 Referensi
+
+1. NIST SP 800-232, *Ascon-Based Lightweight Cryptography Standards for Constrained Devices* (2025).
+2. C. Dobraunig, M. Eichlseder, F. Mendel, M. Schläffer, *Ascon v1.2: Lightweight Authenticated Encryption and Hashing*, Journal of Cryptology, 2021.
+3. C. E. Cummings, *Simulation and Synthesis Techniques for Asynchronous FIFO Design*, SNUG San Jose, 2002.
+4. Terasic, *DE10-Nano User Manual*.
+5. Intel, *Cyclone V Device Handbook* dan *Cyclone V HPS Technical Reference Manual*.
