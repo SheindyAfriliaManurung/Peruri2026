@@ -69,7 +69,7 @@ Berdasarkan *Slow 1100mV 100C Model*, sirkuit VHDL ini terbukti melampaui target
 *(Catatan: Pre-silicon verifikasi telah dilakukan menggunakan Questa FSE).*
 
 ## 👥 Tim Pengembang
-* **Agat (Ketua)** — Arsitektur Digital & Integrasi Top-Level
-* **Anggota 1** — Logika Keamanan & Kriptografi Hardware
-* **Anggota 2** — Manajemen Memori & Sinkronisasi CDC
-* **Sheindy Afrilia Manurung** — Antarmuka I/O & Verifikasi Pengujian
+* **Sheindy Afrilia Manurung (Ketua)** — Arsitektur Digital & Integrasi Top-Level
+* **M. Hathori Astro** — Logika Keamanan & Kriptografi Hardware
+* **Afifah Zuriah Mindarini** — Manajemen Memori & Sinkronisasi CDC
+* **Agatha Triotama** — Antarmuka I/O & Verifikasi Pengujian
